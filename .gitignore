@@ -38,6 +38,9 @@ storage/*.db-shm
 # OS / Editor artifacts
 .DS_Store
 Thumbs.db
+*.exe
+cloudflared*
+backend/tests/verify_live.py
 *.swp
 *.swo
 .vscode/

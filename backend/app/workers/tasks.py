@@ -102,7 +102,8 @@ async def run_analysis_pipeline(job_id: str, file_path_str: str) -> bool:
             summary=summary,
             top_sources=top_sources,
             matches=matches,
-            sections=segmented.sections
+            sections=segmented.sections,
+            original_pdf_path=file_path
         )
 
         duration = time.time() - start_time
