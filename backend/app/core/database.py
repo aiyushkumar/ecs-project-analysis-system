@@ -1,4 +1,6 @@
 import json
+import uuid
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -6,12 +8,16 @@ from pathlib import Path
 from typing import Any
 from backend.app.core.config import settings
 
+logger = logging.getLogger(__name__)
+
 DB_PATH = settings.STORAGE_DIR / "ecs.db"
 _lock = threading.Lock()
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 def init_db():
@@ -207,120 +213,133 @@ class DatabaseManager:
     ):
         with _lock:
             conn = get_connection()
-            cursor = conn.cursor()
-            
-            # Update job record
-            cursor.execute("""
-                UPDATE analysis_jobs
-                SET status = 'completed',
-                    stage = 'Analysis Completed',
-                    stage_progress = 100,
-                    page_count = ?,
-                    word_count = ?,
-                    character_count = ?,
-                    file_hash = ?,
-                    overall_similarity = ?,
-                    internet_percentage = ?,
-                    publications_percentage = ?,
-                    crossref_percentage = ?,
-                    github_percentage = ?,
-                    exact_similarity = ?,
-                    lexical_similarity = ?,
-                    semantic_similarity = ?,
-                    code_similarity = ?,
-                    sections_json = ?,
-                    report_path = ?,
-                    processing_duration_sec = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (
-                page_count, word_count, char_count, file_hash,
-                overall_similarity, internet_percentage, publications_percentage,
-                crossref_percentage, github_percentage, exact_similarity,
-                lexical_similarity, semantic_similarity, code_similarity,
-                json.dumps(sections), report_path, duration_sec, job_id
-            ))
-
-            # Insert sources
-            for s in sources:
+            try:
+                cursor = conn.cursor()
+                
+                # Update job record
                 cursor.execute("""
-                    INSERT INTO sources (id, job_id, source_number, title, url, category, author_or_owner, publication_or_repo, percentage, match_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    s["source_id"], job_id, s["source_number"], s["title"], s["url"],
-                    s["category"], s.get("author_or_owner", "Unknown"),
-                    s.get("publication_or_repo", ""), s.get("percentage", 0.0), s.get("match_count", 0)
-                ))
-
-            # Insert matches
-            for m in matches:
-                cursor.execute("""
-                    INSERT INTO similarity_matches (
-                        id, job_id, source_id, source_number, source_title, source_url,
-                        source_category, page_number, section_name, matched_text,
-                        source_excerpt, match_type, confidence, start_char, end_char
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    m["match_id"], job_id, m.get("source_id"), m["source_number"],
-                    m["source_title"], m["source_url"], m["source_category"],
-                    m["page_number"], m["section_name"], m["matched_text"],
-                    m["source_excerpt"], m["match_type"], m["confidence"],
-                    m.get("start_char", 0), m.get("end_char", 0)
-                ))
-
-            # Check if part of batch
-            cursor.execute("SELECT batch_id FROM analysis_jobs WHERE id = ?", (job_id,))
-            b_row = cursor.fetchone()
-            if b_row and b_row["batch_id"]:
-                batch_id = b_row["batch_id"]
-                cursor.execute("""
-                    UPDATE batch_jobs
-                    SET completed_files = completed_files + 1,
+                    UPDATE analysis_jobs
+                    SET status = 'completed',
+                        stage = 'Analysis Completed',
+                        stage_progress = 100,
+                        page_count = ?,
+                        word_count = ?,
+                        character_count = ?,
+                        file_hash = ?,
+                        overall_similarity = ?,
+                        internet_percentage = ?,
+                        publications_percentage = ?,
+                        crossref_percentage = ?,
+                        github_percentage = ?,
+                        exact_similarity = ?,
+                        lexical_similarity = ?,
+                        semantic_similarity = ?,
+                        code_similarity = ?,
+                        sections_json = ?,
+                        report_path = ?,
+                        processing_duration_sec = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                """, (batch_id,))
-                
-                # Check if batch is fully done
-                cursor.execute("SELECT total_files, completed_files, failed_files FROM batch_jobs WHERE id = ?", (batch_id,))
-                b_info = cursor.fetchone()
-                if b_info and (b_info["completed_files"] + b_info["failed_files"] >= b_info["total_files"]):
-                    cursor.execute("UPDATE batch_jobs SET status = 'completed' WHERE id = ?", (batch_id,))
+                """, (
+                    page_count, word_count, char_count, file_hash,
+                    overall_similarity, internet_percentage, publications_percentage,
+                    crossref_percentage, github_percentage, exact_similarity,
+                    lexical_similarity, semantic_similarity, code_similarity,
+                    json.dumps(sections), report_path, duration_sec, job_id
+                ))
 
-            conn.commit()
-            conn.close()
+                # Insert sources with globally unique compound primary key
+                for s in sources:
+                    src_pk = f"{job_id}_{s.get('source_number', 0)}_{s.get('source_id', uuid.uuid4().hex[:6])}"
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO sources (id, job_id, source_number, title, url, category, author_or_owner, publication_or_repo, percentage, match_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        src_pk, job_id, s["source_number"], s["title"], s["url"],
+                        s["category"], s.get("author_or_owner", "Unknown"),
+                        s.get("publication_or_repo", ""), s.get("percentage", 0.0), s.get("match_count", 0)
+                    ))
+
+                # Insert matches with globally unique primary key
+                for m in matches:
+                    match_pk = f"{job_id}_{m.get('match_id', uuid.uuid4().hex)}"
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO similarity_matches (
+                            id, job_id, source_id, source_number, source_title, source_url,
+                            source_category, page_number, section_name, matched_text,
+                            source_excerpt, match_type, confidence, start_char, end_char
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        match_pk, job_id, m.get("source_id"), m["source_number"],
+                        m["source_title"], m["source_url"], m["source_category"],
+                        m["page_number"], m["section_name"], m["matched_text"],
+                        m["source_excerpt"], m["match_type"], m["confidence"],
+                        m.get("start_char", 0), m.get("end_char", 0)
+                    ))
+
+                # Check if part of batch
+                cursor.execute("SELECT batch_id FROM analysis_jobs WHERE id = ?", (job_id,))
+                b_row = cursor.fetchone()
+                if b_row and b_row["batch_id"]:
+                    batch_id = b_row["batch_id"]
+                    cursor.execute("""
+                        UPDATE batch_jobs
+                        SET completed_files = completed_files + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (batch_id,))
+                    
+                    # Check if batch is fully done
+                    cursor.execute("SELECT total_files, completed_files, failed_files FROM batch_jobs WHERE id = ?", (batch_id,))
+                    b_info = cursor.fetchone()
+                    if b_info and (b_info["completed_files"] + b_info["failed_files"] >= b_info["total_files"]):
+                        cursor.execute("UPDATE batch_jobs SET status = 'completed' WHERE id = ?", (batch_id,))
+
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Error completing job {job_id} in database: {e}", exc_info=True)
+                raise
+            finally:
+                conn.close()
 
     @staticmethod
     def fail_job(job_id: str, error_msg: str):
         with _lock:
             conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE analysis_jobs
-                SET status = 'failed',
-                    stage = 'Analysis Failed',
-                    error_message = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (error_msg, job_id))
-
-            cursor.execute("SELECT batch_id FROM analysis_jobs WHERE id = ?", (job_id,))
-            b_row = cursor.fetchone()
-            if b_row and b_row["batch_id"]:
-                batch_id = b_row["batch_id"]
+            try:
+                cursor = conn.cursor()
                 cursor.execute("""
-                    UPDATE batch_jobs
-                    SET failed_files = failed_files + 1,
+                    UPDATE analysis_jobs
+                    SET status = 'failed',
+                        stage = 'Analysis Failed',
+                        error_message = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                """, (batch_id,))
-                
-                cursor.execute("SELECT total_files, completed_files, failed_files FROM batch_jobs WHERE id = ?", (batch_id,))
-                b_info = cursor.fetchone()
-                if b_info and (b_info["completed_files"] + b_info["failed_files"] >= b_info["total_files"]):
-                    cursor.execute("UPDATE batch_jobs SET status = 'completed' WHERE id = ?", (batch_id,))
+                """, (error_msg, job_id))
 
-            conn.commit()
-            conn.close()
+                cursor.execute("SELECT batch_id FROM analysis_jobs WHERE id = ?", (job_id,))
+                b_row = cursor.fetchone()
+                if b_row and b_row["batch_id"]:
+                    batch_id = b_row["batch_id"]
+                    cursor.execute("""
+                        UPDATE batch_jobs
+                        SET failed_files = failed_files + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (batch_id,))
+                    
+                    cursor.execute("SELECT total_files, completed_files, failed_files FROM batch_jobs WHERE id = ?", (batch_id,))
+                    b_info = cursor.fetchone()
+                    if b_info and (b_info["completed_files"] + b_info["failed_files"] >= b_info["total_files"]):
+                        cursor.execute("UPDATE batch_jobs SET status = 'completed' WHERE id = ?", (batch_id,))
+
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Error marking job {job_id} failed: {e}", exc_info=True)
+            finally:
+                conn.close()
 
     @staticmethod
     def get_job_sources(job_id: str) -> list[dict]:
