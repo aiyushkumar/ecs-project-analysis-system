@@ -2,15 +2,16 @@ import asyncio
 import logging
 import time
 import zipfile
+import re
 from datetime import datetime
 from pathlib import Path
 
 from backend.app.core.config import settings
 from backend.app.core.database import DatabaseManager
-from backend.app.core.security import compute_file_sha256, validate_pdf_signature
-from backend.app.models.schemas import ProcessingStage, JobStatus
+from backend.app.models.schemas import ProcessingStage
 from backend.app.pdf_processing.extractor import extract_pdf_document
 from backend.app.pdf_processing.segmenter import segment_report
+from backend.app.core.security import validate_pdf_signature, compute_file_sha256
 from backend.app.connectors.github_connector import GitHubConnector
 from backend.app.connectors.scholarly_connector import ScholarlyConnector
 from backend.app.connectors.web_connector import WebSearchConnector
@@ -46,26 +47,39 @@ async def run_analysis_pipeline(job_id: str, file_path_str: str) -> bool:
         DatabaseManager.update_job_stage(job_id, ProcessingStage.DOCUMENT_UNDERSTANDING.value, stage_progress=40)
         segmented = segment_report(extracted_doc)
 
-        # Extract distinctive queries from Title, Abstract, and Key Sections
-        import re
-        clean_title = re.sub(r'[\d_\-]+', ' ', Path(extracted_doc.filename).stem).strip()
-        queries = [clean_title] if len(clean_title) >= 4 else ["Project Report"]
+        # Build comprehensive queries for discovery
+        clean_filename = re.sub(r'[\d_\-]+', ' ', Path(extracted_doc.filename).stem).strip()
+        doc_title = segmented.detected_title or (clean_filename if len(clean_filename) >= 4 else "Project Report")
         
-        # Add abstract excerpt if found
-        if "Abstract" in segmented.sections:
+        queries = [doc_title]
+        
+        # Add DOI if detected
+        if segmented.detected_doi:
+            queries.append(segmented.detected_doi)
+            
+        # Add Keywords
+        if segmented.detected_keywords:
+            queries.append(" ".join(segmented.detected_keywords[:4]))
+            
+        # Add Abstract excerpt
+        if "Abstract" in segmented.sections and segmented.sections["Abstract"]:
             abs_text = " ".join([p.text for p in segmented.sections["Abstract"][:2]])
             if abs_text:
-                queries.append(abs_text[:120])
+                queries.append(abs_text[:140])
                 
-        # Add keywords from text
-        words = [w for w in extracted_doc.full_text.split() if len(w) > 5 and w.isalpha()]
-        if len(words) >= 4:
-            queries.append(" ".join(words[:4]))
+        # Add Methodology terms
+        if "Proposed Methodology" in segmented.sections and segmented.sections["Proposed Methodology"]:
+            meth_text = " ".join([p.text for p in segmented.sections["Proposed Methodology"][:2]])
+            if meth_text:
+                queries.append(meth_text[:120])
 
         # Stage 4: GitHub Source Discovery
         DatabaseManager.update_job_stage(job_id, ProcessingStage.GITHUB_SOURCE_DISCOVERY.value, stage_progress=55)
         gh_connector = GitHubConnector()
-        gh_sources = await gh_connector.search(queries, max_results=5)
+        gh_queries = list(queries)
+        if segmented.detected_repos:
+            gh_queries.extend([r.split("/")[-1] for r in segmented.detected_repos if "/" in r])
+        gh_sources = await gh_connector.search(gh_queries, max_results=5)
 
         # Stage 5: Research Paper Analysis
         DatabaseManager.update_job_stage(job_id, ProcessingStage.RESEARCH_PAPER_ANALYSIS.value, stage_progress=70)
@@ -75,7 +89,10 @@ async def run_analysis_pipeline(job_id: str, file_path_str: str) -> bool:
         # Stage 6: Internet Source Analysis
         DatabaseManager.update_job_stage(job_id, ProcessingStage.INTERNET_SOURCE_ANALYSIS.value, stage_progress=80)
         web_connector = WebSearchConnector()
-        web_sources = await web_connector.search(queries, max_results=6)
+        web_queries = list(queries)
+        if segmented.detected_dataset_urls:
+            web_queries.extend(segmented.detected_dataset_urls[:2])
+        web_sources = await web_connector.search(web_queries, max_results=6)
 
         # Combine all retrieved candidate sources
         all_candidate_sources = gh_sources + scholar_sources + web_sources
@@ -85,7 +102,7 @@ async def run_analysis_pipeline(job_id: str, file_path_str: str) -> bool:
         hybrid_engine = HybridSimilarityEngine()
         summary, top_sources, matches = hybrid_engine.analyze(segmented, all_candidate_sources)
 
-        # Stage 8: PDF Report Generation (RPi_CSR format)
+        # Stage 8: PDF Report Generation (Comprehensive Similarity Audit Dossier)
         DatabaseManager.update_job_stage(job_id, ProcessingStage.PDF_REPORT_GENERATION.value, stage_progress=95)
         report_filename = f"ECS_Report_{job_id[:8]}_{file_path.stem}.pdf"
         report_path = settings.REPORT_DIR / report_filename
@@ -103,7 +120,9 @@ async def run_analysis_pipeline(job_id: str, file_path_str: str) -> bool:
             top_sources=top_sources,
             matches=matches,
             sections=segmented.sections,
-            original_pdf_path=file_path
+            original_pdf_path=file_path,
+            detected_title=doc_title,
+            include_raw_document=False
         )
 
         duration = time.time() - start_time

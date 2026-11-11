@@ -1,5 +1,7 @@
 import base64
 import logging
+import re
+import urllib.parse
 from typing import Any
 import httpx
 
@@ -35,14 +37,15 @@ class GitHubConnector(BaseSourceConnector):
 
         async with httpx.AsyncClient(timeout=10.0, headers=self.headers) as client:
             for query in queries[:4]:
-                clean_q = query.strip()
+                clean_q = re.sub(r'[\r\n\t]+', ' ', str(query)).strip()
+                clean_q = re.sub(r'\s+', ' ', clean_q)
                 if not clean_q or len(clean_q) < 4:
                     continue
                 if clean_q in self._cache:
                     return self._cache[clean_q][:max_results]
                 
                 try:
-                    url = f"https://api.github.com/search/repositories?q={clean_q}&sort=stars&order=desc&per_page=5"
+                    url = f"https://api.github.com/search/repositories?q={urllib.parse.quote(clean_q)}&sort=stars&order=desc&per_page=5"
                     resp = await client.get(url)
                     
                     if resp.status_code == 403:

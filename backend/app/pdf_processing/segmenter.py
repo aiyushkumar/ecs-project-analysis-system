@@ -3,16 +3,16 @@ from typing import NamedTuple
 from backend.app.pdf_processing.extractor import ExtractedDocument, ExtractedBlock
 
 SECTION_PATTERNS = [
-    ("Abstract", re.compile(r'^\s*(?:[0-9]+\.?\s*)?abstract\b', re.IGNORECASE)),
+    ("Abstract", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:a\s*b\s*s\s*t\s*r\s*a\s*c\s*t|abstract|executive\s+summary|synopsis)\b', re.IGNORECASE)),
     ("Introduction", re.compile(r'^\s*(?:[0-9]+\.?\s*)?introduction\b', re.IGNORECASE)),
     ("Problem Statement", re.compile(r'^\s*(?:[0-9]+\.?\s*)?problem\s+statement\b', re.IGNORECASE)),
-    ("Literature Survey", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:literature\s+(?:survey|review)|related\s+works?)\b', re.IGNORECASE)),
-    ("Proposed Methodology", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:proposed\s+(?:methodology|system|work|model)|methodology)\b', re.IGNORECASE)),
+    ("Literature Survey", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:literature\s+(?:survey|review)|related\s+works?|background|prior\s+art|prior\s+work)\b', re.IGNORECASE)),
+    ("Proposed Methodology", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:proposed\s+(?:methodology|system|work|model)|methodology|materials\s+and\s+methods|system\s+design|methods|experimental\s+setup)\b', re.IGNORECASE)),
     ("System Architecture", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:system\s+architecture|architecture|workflow)\b', re.IGNORECASE)),
-    ("Implementation", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:implementation|system\s+design|experimental\s+setup)\b', re.IGNORECASE)),
-    ("Results & Discussion", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:results?(?:\s+and\s+discussion)?|evaluation|performance\s+analysis)\b', re.IGNORECASE)),
-    ("Conclusion", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:conclusion(?:\s+and\s+future\s+scope)?|summary)\b', re.IGNORECASE)),
-    ("References", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:references|bibliography)\b', re.IGNORECASE)),
+    ("Implementation", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:implementation|system\s+design|tool\s+design|experimental\s+setup)\b', re.IGNORECASE)),
+    ("Results & Discussion", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:results?(?:\s+and\s+discussion)?|evaluation|performance\s+analysis|experimental\s+results)\b', re.IGNORECASE)),
+    ("Conclusion", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:conclusion(?:\s+and\s+future\s+scope)?|summary|concluding\s+remarks)\b', re.IGNORECASE)),
+    ("References", re.compile(r'^\s*(?:[0-9]+\.?\s*)?(?:references|bibliography|literature\s+cited)\b', re.IGNORECASE)),
 ]
 
 class ReportPassage:
@@ -44,13 +44,109 @@ class SegmentedReport:
         self.detected_section_names: list[str] = []
         self.all_passages: list[ReportPassage] = []
         self.references: list[str] = []
+        self.detected_title: str = ""
+        self.detected_doi: str = ""
+        self.detected_keywords: list[str] = []
+        self.detected_repos: list[str] = []
+        self.detected_dataset_urls: list[str] = []
+        self.detected_authors: list[str] = []
+
+def extract_document_metadata(doc: ExtractedDocument) -> dict:
+    """
+    Extracts high-fidelity academic metadata from document text and Page 1 layout blocks:
+    - Real paper or project report title (filtering publisher headers, affiliations, journal names)
+    - DOIs (e.g. 10.1016/j.ecoinf.2025.103193)
+    - Keywords list
+    - GitHub, GitLab, and Bitly source repository URLs
+    - External dataset download URLs
+    """
+    journal_markers = [
+        "contents lists available", "journal homepage", "sciencedirect", "elsevier",
+        "springer", "ieee", "article info", "issn", "doi.org", "http://", "https://",
+        "wiley", "nature", "proceedings of"
+    ]
+    affil_markers = [
+        "university", "department", "school of", "college", "institute", "faculty of",
+        "e-mail address", "corresponding author", "received", "accepted", "available online"
+    ]
+    
+    # 1. Find DOI in first page or whole document
+    dois = re.findall(r'10\.\d{4,9}/[A-Za-z0-9_.-]+', doc.full_text)
+    detected_doi = dois[0] if dois else ""
+
+    # 2. Extract Title from Page 1 blocks
+    title_candidates = []
+    seen_journal_header = False
+    
+    for b in doc.blocks[:15]:
+        if b.page_num != 1:
+            break
+        txt = b.text.strip()
+        lines = [l.strip() for l in txt.split("\n") if l.strip()]
+        if not lines:
+            continue
+            
+        first_line = lines[0]
+        lower_txt = txt.lower()
+        
+        if any(m in lower_txt for m in ["journal homepage", "sciencedirect", "contents lists available"]):
+            seen_journal_header = True
+            continue
+            
+        if any(m in lower_txt for m in ["article info", "keywords:", "a b s t r a c t"]):
+            break
+            
+        if any(m in lower_txt for m in affil_markers):
+            continue
+            
+        # Avoid author lines (often have superscripts a, b, c, or comma separated list of names)
+        if re.search(r'\b[a-z]\s*,\s*[A-Z]', txt) or txt.count(",") >= 3:
+            continue
+
+        if len(first_line) >= 20 and not any(m in first_line.lower() for m in journal_markers):
+            title_candidates.append((seen_journal_header, len(first_line), first_line, " ".join(lines)))
+
+    title_candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    detected_title = title_candidates[0][3] if title_candidates else ""
+
+    # 3. Keywords
+    kw_match = re.search(r'Keywords:\s*([\s\S]*?)(?:A\s*B\s*S\s*T\s*R\s*A\s*C\s*T|Abstract|\n\s*\n\s*[0-9])', doc.full_text, re.I)
+    keywords = []
+    if kw_match:
+        for k in re.split(r'[\n,;•]+', kw_match.group(1)):
+            k_clean = k.strip()
+            if 3 <= len(k_clean) <= 60 and not any(m in k_clean.lower() for m in journal_markers):
+                keywords.append(k_clean)
+
+    # 4. Repos & URLs
+    urls = re.findall(r'https?://[^\s<>"\'\)]+', doc.full_text)
+    repos = [u.rstrip(".,;") for u in urls if any(h in u.lower() for h in ["github.com", "bit.ly", "gitlab.com"])]
+    dataset_urls = [u.rstrip(".,;") for u in urls if any(h in u.lower() for h in ["gts.ai", "kaggle.com", "zenodo", "huggingface"])]
+
+    return {
+        "title": detected_title,
+        "doi": detected_doi,
+        "keywords": keywords,
+        "repos": list(set(repos)),
+        "dataset_urls": list(set(dataset_urls))
+    }
 
 def segment_report(doc: ExtractedDocument) -> SegmentedReport:
     """
     Identifies academic headings across pages, segments blocks into logical sections,
     and breaks text into sliding passages of ~50-100 words with page & section metadata.
+    Also extracts document-level metadata (title, DOI, keywords, repos, datasets).
     """
     result = SegmentedReport()
+    
+    # Extract rich metadata
+    meta = extract_document_metadata(doc)
+    result.detected_title = meta.get("title", "")
+    result.detected_doi = meta.get("doi", "")
+    result.detected_keywords = meta.get("keywords", [])
+    result.detected_repos = meta.get("repos", [])
+    result.detected_dataset_urls = meta.get("dataset_urls", [])
+    
     current_section = "Introduction"
     in_references = False
     
@@ -96,8 +192,6 @@ def segment_report(doc: ExtractedDocument) -> SegmentedReport:
             result.all_passages.append(p)
             result.sections.setdefault(current_section, []).append(p)
         else:
-            # Sentence-level or multi-sentence passage chunks
-            # Split by period/newline but group into ~40-80 words
             sentences = re.split(r'(?<=[.!?])\s+', text)
             current_chunk = []
             current_word_count = 0

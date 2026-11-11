@@ -148,7 +148,8 @@ def test_full_page_annotation_matching_rpi_csr(tmp_path: Path):
         summary=summary,
         top_sources=sources,
         matches=matches,
-        original_pdf_path=orig_path
+        original_pdf_path=orig_path,
+        include_raw_document=True
     )
 
     assert output_pdf.exists()
